@@ -6,63 +6,47 @@
  * @date         2022/08/11 10:05
  * @github       https://github.com/xxxily
  */
-import i18n from './i18n'
 import monkeyMenu from './monkeyMenu'
 import configManager from './configManager'
-import { openInTab } from './helper'
 import {
   isInIframe,
   isInCrossOriginFrame
 } from '../libs/utils/index'
-
-function refreshPage (msg) {
-  msg = msg || '配置已更改，马上刷新页面让配置生效？'
-  const status = confirm(msg)
-  if (status) {
-    window.location.reload()
-  }
-}
+import globalFunctional from './globalFunctional'
 
 let monkeyMenuList = [
+  { ...globalFunctional.openWebsite },
+  // { ...globalFunctional.openHotkeysPage },
   {
-    title: i18n.t('website'),
-    fn: () => {
-      openInTab('https://h5player.anzz.top/')
-    }
+    ...globalFunctional.openIssuesPage,
+    disable: !configManager.get('enhance.unfoldMenu')
+  },
+  { ...globalFunctional.openDonatePage },
+  {
+    ...globalFunctional.toggleScriptEnableState
   },
   {
-    title: i18n.t('hotkeys'),
-    fn: () => {
-      openInTab('https://h5player.anzz.top/home/Introduction.html#%E5%BF%AB%E6%8D%B7%E9%94%AE%E5%88%97%E8%A1%A8')
-    }
+    ...globalFunctional.toggleGUIStatusUnderCurrentSite,
+    disable: configManager.getLocalStorage('ui.enable') !== false
   },
   {
-    title: i18n.t('issues'),
-    fn: () => {
-      openInTab('https://github.com/xxxily/h5player/issues')
-    }
+    ...globalFunctional.toggleGUIStatus,
+    disable: configManager.getGlobalStorage('ui.enable') === false ? false : !configManager.get('enhance.unfoldMenu')
   },
   {
-    title: i18n.t('donate'),
-    fn: () => {
-      openInTab('https://h5player.anzz.top/#%E8%B5%9E')
-    }
+    ...globalFunctional.toggleHotkeysStatusUnderCurrentSite,
+    disable: configManager.getLocalStorage('enableHotkeys') !== false
   },
   {
-    title: i18n.t('setting'),
-    disable: true,
-    fn: () => {
-      openInTab('https://h5player.anzz.top/configure/', null, true)
-      window.alert('功能开发中，敬请期待...')
-    }
+    ...globalFunctional.toggleHotkeysStatus,
+    disable: configManager.get('enableHotkeys') !== false
   },
+  { ...globalFunctional.openCustomConfigurationEditor },
+  /* 展开或收起菜单 */
+  { ...globalFunctional.toggleExpandedOrCollapsedStateOfMonkeyMenu },
   {
-    title: i18n.t('restoreConfiguration'),
-    disable: false,
-    fn: () => {
-      configManager.clear()
-      refreshPage()
-    }
+    ...globalFunctional.restoreGlobalConfiguration,
+    disable: !configManager.get('enhance.unfoldMenu')
   }
 ]
 
@@ -101,60 +85,52 @@ export function addMenu (menuOpts, before) {
 export function registerH5playerMenus (h5player) {
   const t = h5player
   const player = t.player()
+  const foldMenu = !configManager.get('enhance.unfoldMenu')
 
   if (player && !t._hasRegisterH5playerMenus_) {
     const menus = [
       {
-        title: () => i18n.t('openCrossOriginFramePage'),
-        disable: !isInCrossOriginFrame(),
-        fn: () => {
-          openInTab(location.href)
-        }
+        ...globalFunctional.openCrossOriginFramePage,
+        disable: foldMenu || !isInCrossOriginFrame()
       },
       {
-        title: () => `${configManager.get('enhance.blockSetCurrentTime') ? i18n.t('unblockSetCurrentTime') : i18n.t('blockSetCurrentTime')} 「${i18n.t('localSetting')}」`,
+        ...globalFunctional.toggleSetCurrentTimeFunctional,
         type: 'local',
-        fn: () => {
-          const confirm = window.confirm(configManager.get('enhance.blockSetCurrentTime') ? i18n.t('unblockSetCurrentTime') : i18n.t('blockSetCurrentTime'))
-          if (confirm) {
-            configManager.setLocalStorage('enhance.blockSetCurrentTime', !configManager.get('enhance.blockSetCurrentTime'))
-            window.location.reload()
-          }
-        }
+        disable: foldMenu
       },
       {
-        title: () => `${configManager.get('enhance.blockSetVolume') ? i18n.t('unblockSetVolume') : i18n.t('blockSetVolume')} 「${i18n.t('localSetting')}」`,
+        ...globalFunctional.toggleSetVolumeFunctional,
         type: 'local',
-        fn: () => {
-          const confirm = window.confirm(configManager.get('enhance.blockSetVolume') ? i18n.t('unblockSetVolume') : i18n.t('blockSetVolume'))
-          if (confirm) {
-            configManager.setLocalStorage('enhance.blockSetVolume', !configManager.get('enhance.blockSetVolume'))
-            window.location.reload()
-          }
-        }
+        disable: foldMenu
       },
       {
-        title: () => `${configManager.get('enhance.blockSetPlaybackRate') ? i18n.t('unblockSetPlaybackRate') : i18n.t('blockSetPlaybackRate')} 「${i18n.t('globalSetting')}」`,
+        ...globalFunctional.toggleSetPlaybackRateFunctional,
         type: 'global',
-        fn: () => {
-          const confirm = window.confirm(configManager.get('enhance.blockSetPlaybackRate') ? i18n.t('unblockSetPlaybackRate') : i18n.t('blockSetPlaybackRate'))
-          if (confirm) {
-            /* 倍速参数，只能全局设置 */
-            configManager.setGlobalStorage('enhance.blockSetPlaybackRate', !configManager.get('enhance.blockSetPlaybackRate'))
-            window.location.reload()
-          }
-        }
+        disable: foldMenu
       },
       {
-        title: () => `${configManager.get('enhance.allowExperimentFeatures') ? i18n.t('notAllowExperimentFeatures') : i18n.t('allowExperimentFeatures')} 「${i18n.t('globalSetting')}」`,
+        ...globalFunctional.toggleAcousticGainFunctional,
         type: 'global',
-        fn: () => {
-          const confirm = window.confirm(configManager.get('enhance.allowExperimentFeatures') ? i18n.t('notAllowExperimentFeatures') : i18n.t('experimentFeaturesWarning'))
-          if (confirm) {
-            configManager.setGlobalStorage('enhance.allowExperimentFeatures', !configManager.get('enhance.allowExperimentFeatures'))
-            window.location.reload()
-          }
-        }
+        disable: foldMenu
+      },
+      {
+        ...globalFunctional.toggleCrossOriginControlFunctional,
+        type: 'global',
+        disable: foldMenu
+      },
+      {
+        ...globalFunctional.toggleExperimentFeatures,
+        type: 'global',
+        disable: foldMenu
+      },
+      {
+        ...globalFunctional.toggleExternalCustomConfiguration,
+        type: 'global',
+        disable: foldMenu
+      },
+      {
+        ...globalFunctional.toggleDebugMode,
+        disable: foldMenu
       }
     ]
 

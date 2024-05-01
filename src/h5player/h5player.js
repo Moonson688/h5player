@@ -1,7 +1,7 @@
 import './comment'
-import configManager from './configManager'
 import originalMethods from './originalMethods'
-import h5PlayerTccInit from './h5PlayerTccInit'
+import configManager from './configManager'
+import { h5PlayerTccInit, mergeTaskConf } from './h5PlayerTccInit'
 import { setFakeUA } from './userAgent'
 import FullScreen from '../libs/FullScreen/index'
 import videoCapturer from '../libs/videoCapturer/index'
@@ -13,11 +13,11 @@ import debug from './debug'
 import hackDefineProperty from './hackDefineProperty'
 import { menuRegister, addMenu, registerH5playerMenus } from './menuManager'
 import { proxyHTMLMediaElementEvent } from './hackEventListener'
+import mediaSource from './mediaSource'
 import {
   ready,
   hackAttachShadow,
   mediaCore,
-  mediaSource,
   isObj,
   quickSort,
   eachParentNode,
@@ -30,7 +30,12 @@ import {
   objToInlineStyle,
   clone
 } from '../libs/utils/index'
+import HotkeysRunner from '../libs/utils/hotkeysRunner'
+import MediaElementAmplifier from '../libs/utils/MediaElementAmplifier'
 import mediaDownload from './mediaDownload'
+import windowSandbox from './h5playerUISandbox'
+import version from './version'
+import remoteHelper from './remoteHelper'
 
 import {
   isRegisterKey,
@@ -42,7 +47,9 @@ import {
   isAudioElement
 } from './helper'
 
-window._debugMode_ = true
+import { registerMouseEvent } from './mouseEvent'
+
+import h5playerUiWraper from './ui/h5playerUI.es'
 
 /* 定义支持哪些媒体标签 */
 // const supportMediaTags = ['video', 'bwp-video', 'audio']
@@ -50,6 +57,7 @@ const supportMediaTags = ['video', 'bwp-video']
 
 let TCC = null
 const h5Player = {
+  version,
   mediaCore,
   mediaPlusApi: null,
   mediaSource,
@@ -87,12 +95,43 @@ const h5Player = {
 
   playbackRate: configManager.get('media.playbackRate'),
   volume: configManager.get('media.volume'),
-  lastPlaybackRate: 1,
+  lastPlaybackRate: configManager.get('media.lastPlaybackRate'),
   /* 快进快退步长 */
   skipStep: 5,
 
   /* 监听鼠标活动的观察对象 */
   mouseObserver: new MouseObserver(),
+
+  disableHotkeysTemporarily () {
+    this.__disableHotkeysTemporarily__ = true
+  },
+  enableHotkeys () {
+    this.__disableHotkeysTemporarily__ = false
+  },
+  toggleHotkeys () {
+    const confirm = window.confirm(this.__disableHotkeysTemporarily__ ? i18n.t('enableHotkeys') : i18n.t('disableHotkeys'))
+    if (confirm) {
+      this.__disableHotkeysTemporarily__ = !this.__disableHotkeysTemporarily__
+    }
+  },
+
+  debuggerNow () {
+    if (debug.isDebugMode()) {
+      const script = document.createElement('script')
+      script.innerText = 'debugger'
+      document.body.appendChild(script)
+    }
+  },
+
+  /* 关闭当前视频实例的UI界面，以便消除UI界面对其他元素遮挡等相关影响 */
+  disableCurrentInstanceGUI () {
+    const t = this
+    const player = t.player()
+    if (player && t.UI && t.UI.removePopupWrapByElement) {
+      player.__disableGUITemporarily__ = true
+      t.UI.removePopupWrapByElement(player)
+    }
+  },
 
   /* 获取当前播放器的实例 */
   player: function () {
@@ -210,6 +249,9 @@ const h5Player = {
     player._fullScreen_ = new FullScreen(player)
     player._fullPageScreen_ = new FullScreen(player, true)
 
+    /* 注册热键运行器 */
+    t.registerHotkeysRunner()
+
     if (!player._hasCanplayEvent_) {
       player.addEventListener('canplay', function (event) {
         t.initAutoPlay(player)
@@ -265,19 +307,21 @@ const h5Player = {
       TCC.doTask('init', player)
     }
 
+    const needInitEvent = !player.__registeredInitEvent__
+
     /* 注册鼠标响应事件 */
-    t.mouseObserver.on(player, 'click', function (event, offset, target) {
+    needInitEvent && t.mouseObserver.on(player, 'click', function (event, offset, target) {
       // debug.log('捕捉到鼠标点击事件：', event, offset, target)
     })
 
     /* 画中画事件监听 */
-    player.addEventListener('enterpictureinpicture', () => {
+    needInitEvent && player.addEventListener('enterpictureinpicture', () => {
       monkeyMsg.send('globalPictureInPictureInfo', {
         usePictureInPicture: true
       })
       debug.log('enterpictureinpicture', player)
     })
-    player.addEventListener('leavepictureinpicture', () => {
+    needInitEvent && player.addEventListener('leavepictureinpicture', () => {
       t.leavepictureinpictureTime = Date.now()
 
       monkeyMsg.send('globalPictureInPictureInfo', {
@@ -286,14 +330,98 @@ const h5Player = {
       debug.log('leavepictureinpicture', player)
     })
 
-    if (debug.isDebugMode()) {
-      player.addEventListener('loadeddata', function () {
-        debug.log(`video url: ${player.src} video duration: ${player.duration} video dom:`, player)
-      })
+    // if (debug.isDebugMode()) {}
 
-      player.addEventListener('durationchange', function () {
-        debug.log(`video durationchange: ${player.duration}`)
-      })
+    /* 记录player使用过的src */
+    function srcRecord (player) {
+      const src = player.currentSrc || player.src
+      if (!src) { return }
+
+      player.srcList = player.srcList || [src]
+      if (!player.srcList.includes(src)) {
+        player.srcList.push(src)
+      }
+    }
+
+    function updataBufferedTime (player) {
+      /* 随时记录缓存数据到了哪个时间节点 */
+      if (player.buffered.length > 0) {
+        const bufferedTime = player.buffered.end(player.buffered.length - 1)
+        player.bufferedTime = bufferedTime
+      }
+
+      if (t.autoGotoBufferedTime && player.bufferedTime && t.player() === player && player.bufferedTime < player.duration - 1 && player.currentTime < player.bufferedTime - 1) {
+        t.setCurrentTime(player.bufferedTime)
+      }
+    }
+
+    needInitEvent && player.addEventListener('loadeddata', function () {
+      debug.log(`[player][loadeddata] ${player.src} video duration: ${player.duration} video dom:`, player)
+      srcRecord(player)
+    })
+    needInitEvent && player.addEventListener('durationchange', function () {
+      debug.log(`[player][durationchange] ${player.duration}`)
+      srcRecord(player)
+    })
+
+    needInitEvent && player.addEventListener('loadstart', function () {
+      debug.log('[player][loadstart]', player.currentSrc, player.src)
+      srcRecord(player)
+    })
+
+    /* 注册UI界面 */
+    t.UI && t.UI.popup && t.UI.popup(player, t)
+
+    /* 在播放或暂停时，也尝试注册UI界面，这样即使popup被意外删除，也还是能正常再次创建回来 */
+    needInitEvent && player.addEventListener('play', function () {
+      t.UI && t.UI.popup && t.UI.popup(player, t)
+    })
+    needInitEvent && player.addEventListener('pause', function () {
+      t.UI && t.UI.popup && t.UI.popup(player, t)
+    })
+    let lastRegisterUIPopupTime = Date.now()
+    let tryRegisterUIPopupCount = 0
+    needInitEvent && player.addEventListener('timeupdate', function () {
+      // updataBufferedTime(player)
+
+      if (Date.now() - lastRegisterUIPopupTime > 800 && tryRegisterUIPopupCount < 60) {
+        lastRegisterUIPopupTime = Date.now()
+        tryRegisterUIPopupCount += 1
+        t.UI && t.UI.popup && t.UI.popup(player, t)
+      }
+
+      srcRecord(player)
+      mediaSource.connectMediaSourceWithMediaElement(player)
+    })
+
+    let lastCleanMediaSourceDataTime = Date.now()
+    needInitEvent && player.addEventListener('progress', () => {
+      updataBufferedTime(player)
+      mediaSource.connectMediaSourceWithMediaElement(player)
+
+      if (Date.now() - lastCleanMediaSourceDataTime > 1000 * 10) {
+        lastCleanMediaSourceDataTime = Date.now()
+        mediaSource.cleanMediaSourceData()
+      }
+    })
+
+    needInitEvent && player.addEventListener('durationchange', function () {
+      lastRegisterUIPopupTime = Date.now()
+      tryRegisterUIPopupCount = 0
+      t.UI && t.UI.popup && t.UI.popup(player, t)
+    })
+
+    player.__registeredInitEvent__ = true
+  },
+
+  registerHotkeysRunner () {
+    if (!this.hotkeysRunner) {
+      this.hotkeysRunner = new HotkeysRunner(configManager.get('hotkeys'))
+
+      if (isInIframe() && !isInCrossOriginFrame()) {
+        /* 让顶层页面也可以监听组合键的触发 */
+        this.hotkeysRunner.setCombinationKeysMonitor(window.top)
+      }
     }
   },
 
@@ -435,6 +563,27 @@ const h5Player = {
     }
   },
 
+  printPlayerInfo (p) {
+    const t = this
+    const player = p || t.player()
+
+    const info = {
+      curPlayer: player,
+      srcList: player.srcList,
+      h5player: t,
+      h5playerUI: t.UI,
+      mediaSource,
+      window
+    }
+
+    if (t.UI && t.UI.findPopupWrapWithElement) {
+      info.curlPopupWrap = t.UI.findPopupWrapWithElement(player)
+      info.allPopupWrap = t.UI.getAllPopupWrapElement()
+    }
+
+    debug.info('[playerInfo]', info)
+  },
+
   /* 设置视频全屏 */
   setFullScreen () {
     const player = this.player()
@@ -509,12 +658,22 @@ const h5Player = {
     return Date.now() - this.playbackRateInfo.lockTimeout < 0
   },
 
+  /* 解决高低倍速频繁切换后，音画不同步的问题 */
+  fixPlaybackRate: function (oldPlaybackRate) {
+    const t = this
+    const curPlaybackRate = t.getPlaybackRate()
+
+    if (Math.abs(curPlaybackRate - oldPlaybackRate) > 1) {
+      t.setCurrentTimeUp(0.1, true)
+    }
+  },
+
   /* 设置播放速度 */
-  setPlaybackRate: function (num, notips, duplicate) {
+  setPlaybackRate: function (num, notips, duplicate, skipLock) {
     const t = this
     const player = t.player()
 
-    if (t.isLockPlaybackRate()) {
+    if (!skipLock && t.isLockPlaybackRate()) {
       debug.info('调速能力已被锁定')
       return false
     }
@@ -525,6 +684,8 @@ const h5Player = {
     }
 
     if (!player) return
+
+    const oldPlaybackRate = t.getPlaybackRate()
 
     let curPlaybackRate
     if (num) {
@@ -570,6 +731,7 @@ const h5Player = {
         }
       })
 
+      t.fixPlaybackRate(oldPlaybackRate)
       return true
     }
 
@@ -644,6 +806,8 @@ const h5Player = {
       /* 600ms时重新触发无效的话，再来个1200ms后触发，如果是1200ms才生效，则调速生效的延迟已经非常明显了 */
       t._setPlaybackRateDuplicate2_ = setTimeout(duplicatePlaybackRate, 1200)
     }
+
+    t.fixPlaybackRate(oldPlaybackRate)
   },
 
   /**
@@ -654,7 +818,7 @@ const h5Player = {
    */
   setPlaybackRatePlus: function (num) {
     num = Number(num)
-    if (!num || !Number.isInteger(num)) {
+    if (!num || Number.isNaN(num)) {
       return false
     }
 
@@ -683,13 +847,15 @@ const h5Player = {
     const t = this
     player = player || t.player()
 
+    t.unLockPlaybackRate()
+
     const oldPlaybackRate = Number(player.playbackRate)
     const playbackRate = oldPlaybackRate === 1 ? t.lastPlaybackRate : 1
     if (oldPlaybackRate !== 1) {
       t.lastPlaybackRate = oldPlaybackRate
+      configManager.setLocalStorage('media.lastPlaybackRate', oldPlaybackRate)
     }
 
-    t.unLockPlaybackRate()
     t.setPlaybackRate(playbackRate)
 
     /* 防止外部调速逻辑的干扰，所以锁定一段时间 */
@@ -825,7 +991,7 @@ const h5Player = {
     }
   },
 
-  setCurrentTimeUp (num) {
+  setCurrentTimeUp (num, hideTips) {
     num = Number(numUp(num) || this.skipStep)
 
     if (TCC.doTask('addCurrentTime')) {
@@ -838,7 +1004,9 @@ const h5Player = {
         /* 防止外部进度控制逻辑的干扰，所以锁定一段时间 */
         this.lockCurrentTime(500)
 
-        this.tips(i18n.t('tipsMsg.forward') + num + i18n.t('tipsMsg.seconds'))
+        if (!hideTips) {
+          this.tips(i18n.t('tipsMsg.forward') + num + i18n.t('tipsMsg.seconds'))
+        }
       }
     }
   },
@@ -932,12 +1100,43 @@ const h5Player = {
     num = Number(num).toFixed(2)
     if (num < 0) {
       num = 0
+    }
+
+    if (num > 1 && configManager.get('enhance.allowAcousticGain')) {
+      num = Math.ceil(num)
+
+      try {
+        player._amp_ = player._amp_ || new MediaElementAmplifier(player)
+      } catch (e) {
+        num = 1
+        debug.error('媒体声音响度增益逻辑异常', e)
+      }
+
+      /* 限定增益的最大值 */
+      if (num > 6) {
+        num = 6
+      }
+
+      if (!player._amp_ || !player._amp_.setLoudness) {
+        num = 1
+      }
     } else if (num > 1) {
       num = 1
     }
 
     /* 记录播放音量信息 */
     t.volume = num
+
+    /* 使用音量增益逻辑，增益音量不进行本地存储记录 */
+    if (num > 1 && player._amp_ && player._amp_.setLoudness) {
+      player._amp_.setLoudness(num)
+
+      if (!outerCall) { player.muted = false }
+
+      !notips && t.tips(i18n.t('tipsMsg.volume') + parseInt(num * 100) + '%')
+      return true
+    }
+
     if (isInIframe() || configManager.get('enhance.blockSetVolume') === true) {
       configManager.setGlobalStorage('media.volume', num)
     } else {
@@ -986,18 +1185,22 @@ const h5Player = {
     }
 
     /* 调节音量的时候顺便把静音模式关闭 */
-    if (!outerCall) {
-      player.muted = false
-    }
+    if (!outerCall) { player.muted = false }
 
     !notips && t.tips(i18n.t('tipsMsg.volume') + parseInt(player.volume * 100) + '%')
   },
 
   setVolumeUp (num) {
     num = numUp(num) || 0.2
-    if (this.player()) {
+    const player = this.player()
+    if (player) {
       this.unLockVolume()
-      this.setVolume(this.player().volume + num)
+
+      if (this.volume > 1 && player._amp_) {
+        this.setVolume(this.volume + num)
+      } else {
+        this.setVolume(player.volume + num)
+      }
 
       /* 防止外部调音逻辑的干扰，所以锁定一段时间 */
       this.lockVolume(500)
@@ -1006,9 +1209,15 @@ const h5Player = {
 
   setVolumeDown (num) {
     num = numDown(num) || -0.2
-    if (this.player()) {
+    const player = this.player()
+    if (player) {
       this.unLockVolume()
-      this.setVolume(this.player().volume + num)
+
+      if (this.volume > 1 && player._amp_) {
+        this.setVolume(Math.floor(this.volume + num))
+      } else {
+        this.setVolume(player.volume + num)
+      }
 
       /* 防止外部调音逻辑的干扰，所以锁定一段时间 */
       this.lockVolume(500)
@@ -1115,20 +1324,25 @@ const h5Player = {
 
   /* 缩放视频画面 */
   setScale (num) {
-    this.scale = num
+    if (Number.isNaN(this.scale) || Number.isNaN(num)) {
+      this.scale = 1
+    } else {
+      this.scale = num
+    }
+
     this.setTransform()
   },
 
   /* 视频放大 +0.1 */
-  setScaleUp () {
-    this.scale += 0.05
-    this.setTransform()
+  setScaleUp (num) {
+    num = numUp(num) || 0.05
+    this.setScale(Number(this.scale) + num)
   },
 
   /* 视频缩小 -0.1 */
-  setScaleDown () {
-    this.scale -= 0.05
-    this.setTransform()
+  setScaleDown (num) {
+    num = numDown(num) || -0.05
+    this.setScale(Number(this.scale) + num)
   },
 
   /* 设置视频画面的位移属性 */
@@ -1145,27 +1359,27 @@ const h5Player = {
   },
 
   /* 视频画面向右平移 */
-  setTranslateRight () {
-    this.translate.x += 10
-    this.setTransform()
+  setTranslateRight (num) {
+    num = numUp(num) || 10
+    this.setTranslate(this.translate.x + num)
   },
 
   /* 视频画面向左平移 */
-  setTranslateLeft () {
-    this.translate.x -= 10
-    this.setTransform()
+  setTranslateLeft (num) {
+    num = numDown(num) || -10
+    this.setTranslate(this.translate.x + num)
   },
 
   /* 视频画面向上平移 */
-  setTranslateUp () {
-    this.translate.y -= 10
-    this.setTransform()
+  setTranslateUp (num) {
+    num = numUp(num) || 10
+    this.setTranslate(null, this.translate.y - num)
   },
 
   /* 视频画面向下平移 */
-  setTranslateDown () {
-    this.translate.y += 10
-    this.setTransform()
+  setTranslateDown (num) {
+    num = numDown(num) || -10
+    this.setTranslate(null, this.translate.y - num)
   },
 
   resetTransform (notTips) {
@@ -1220,6 +1434,13 @@ const h5Player = {
     }
   },
 
+  autoGotoBufferedTime: false,
+  toggleAutoGotoBufferedTime () {
+    const t = this
+    t.autoGotoBufferedTime = !t.autoGotoBufferedTime
+    t.tips(t.autoGotoBufferedTime ? i18n.t('autoGotoBufferedTime') : i18n.t('disableAutoGotoBufferedTime'))
+  },
+
   /**
    * 切换画中画功能
    */
@@ -1254,6 +1475,7 @@ const h5Player = {
   switchPlayStatus () {
     const t = this
     const player = t.player()
+
     if (TCC.doTask('switchPlayStatus')) {
       // debug.log('[TCC][switchPlayStatus]', 'suc')
       return
@@ -1279,6 +1501,8 @@ const h5Player = {
 
         t.tips(i18n.t('tipsMsg.play'))
       }
+
+      TCC.doTask('afterPlay')
     } else {
       if (TCC.doTask('pause')) {
         // debug.log('[TCC][pause]', 'suc')
@@ -1299,6 +1523,8 @@ const h5Player = {
 
         t.tips(i18n.t('tipsMsg.pause'))
       }
+
+      TCC.doTask('afterPause')
     }
   },
 
@@ -1369,13 +1595,13 @@ const h5Player = {
 
       backupStyle = parentNode.getAttribute('style-backup') || ''
       if (!backupStyle) {
-        let backupSty = defStyle || 'style-backup:none'
+        let backupSty = defStyle || 'style-backup: none'
         const backupStyObj = inlineStyleToObj(backupSty)
 
         /**
-       * 修复因为缓存时机获取到错误样式的问题
-       * 例如在：https://www.xuetangx.com/
-       */
+         * 修复因为缓存时机获取到错误样式的问题
+         * 例如在：https://www.xuetangx.com/
+         */
         if (backupStyObj.opacity === '0') {
           backupStyObj.opacity = '1'
         }
@@ -1387,6 +1613,11 @@ const h5Player = {
 
         parentNode.setAttribute('style-backup', backupSty)
         backupStyle = defStyle
+      } else {
+        /* 如果defStyle被外部修改了，则需要更新备份样式 */
+        if (defStyle && !defStyle.includes('style-backup')) {
+          backupStyle = defStyle
+        }
       }
 
       const newStyleArr = backupStyle.split(';')
@@ -1412,7 +1643,7 @@ const h5Player = {
       const newPlayerBox = player.getBoundingClientRect()
       if (Math.abs(newPlayerBox.height - playerBox.height) > 50) {
         parentNode.setAttribute('style', backupStyle)
-      // debug.info('应用新样式后给播放器高宽造成了严重的偏差，样式已被还原：', player, playerBox, newPlayerBox)
+        // debug.info('应用新样式后给播放器高宽造成了严重的偏差，样式已被还原：', player, playerBox, newPlayerBox)
       }
     }
 
@@ -1441,7 +1672,7 @@ const h5Player = {
     const style = tipsDom.style
     tipsDom.innerText = str
 
-    for (var i = 0; i < 3; i++) {
+    for (let i = 0; i < 3; i++) {
       if (this.on_off[i]) clearTimeout(this.on_off[i])
     }
 
@@ -1530,8 +1761,8 @@ const h5Player = {
   filter: {
     key: [1, 1, 1, 0, 0],
     setup: function () {
-      var view = 'brightness({0}) contrast({1}) saturate({2}) hue-rotate({3}deg) blur({4}px)'
-      for (var i = 0; i < 5; i++) {
+      let view = 'brightness({0}) contrast({1}) saturate({2}) hue-rotate({3}deg) blur({4}px)'
+      for (let i = 0; i < 5; i++) {
         view = view.replace('{' + i + '}', String(this.key[i]))
         this.key[i] = Number(this.key[i])
       }
@@ -1661,6 +1892,29 @@ const h5Player = {
     t.tips(i18n.t('tipsMsg.imgattrreset'))
   },
 
+  mediaDownload () {
+    if (configManager.get('enhance.allowExperimentFeatures')) {
+      debug.warn('[experimentFeatures][mediaDownload]')
+      mediaDownload(this.player())
+    } else {
+      const result = window.confirm(i18n.t('useMediaDownloadTips'))
+      if (result) {
+        configManager.setGlobalStorage('enhance.allowExperimentFeatures', !configManager.get('enhance.allowExperimentFeatures'))
+        window.location.reload()
+      }
+    }
+  },
+
+  capture () {
+    const player = this.player()
+    videoCapturer.capture(player, true)
+
+    /* 暂停画面 */
+    if (!player.paused && !document.pictureInPictureElement && document.visibilityState !== 'visible') {
+      this.freezeFrame()
+    }
+  },
+
   _isFoucs: false,
 
   /* 播放器的聚焦事件 */
@@ -1696,12 +1950,7 @@ const h5Player = {
 
       // 截图并下载保存
       if (key === 's') {
-        videoCapturer.capture(player, true)
-
-        /* 暂停画面 */
-        if (!player.paused && !document.pictureInPictureElement && document.visibilityState !== 'visible') {
-          t.freezeFrame()
-        }
+        t.capture()
       }
 
       if (key === 'r') {
@@ -1714,10 +1963,7 @@ const h5Player = {
       }
 
       if (key === 'd') {
-        if (configManager.get('enhance.allowExperimentFeatures')) {
-          debug.warn('[experimentFeatures][mediaDownload]')
-          mediaDownload(t.player())
-        }
+        t.mediaDownload()
       }
 
       // 视频画面缩放相关事件
@@ -1727,27 +1973,27 @@ const h5Player = {
       t.scale = Number(t.scale)
       switch (key) {
         // shift+X：视频缩小 -0.1
-        case 'x' :
+        case 'x':
           t.setScaleDown()
           break
         // shift+C：视频放大 +0.1
-        case 'c' :
+        case 'c':
           t.setScaleUp()
           break
         // shift+Z：视频恢复正常大小
-        case 'z' :
+        case 'z':
           t.resetTransform()
           break
-        case 'arrowright' :
+        case 'arrowright':
           t.setTranslateRight()
           break
-        case 'arrowleft' :
+        case 'arrowleft':
           t.setTranslateLeft()
           break
-        case 'arrowup' :
+        case 'arrowup':
           t.setTranslateUp()
           break
-        case 'arrowdown' :
+        case 'arrowdown':
           t.setTranslateDown()
           break
       }
@@ -1981,24 +2227,39 @@ const h5Player = {
     const player = t.player()
 
     /* 处于可编辑元素中不执行任何快捷键 */
-    if (isEditableTarget(event.target)) return
-
-    /* 未用到的按键不进行任何事件监听 */
-    if (!isRegisterKey(event)) return
+    const target = event.composedPath ? event.composedPath()[0] || event.target : event.target
+    if (t.__disableHotkeysTemporarily__ || isEditableTarget(target)) return
 
     /* 广播按键消息，进行跨域控制 */
     monkeyMsg.send('globalKeydownEvent', event, 0)
 
     if (!player) {
       if (t.hasCrossOriginVideoDetected) {
+        if (!configManager.get('enhance.allowCrossOriginControl')) {
+          return false
+        }
+
+        /**
+         * 利用热键运行器的匹配能力来决定要不要禁止事件冒泡和阻止默认事件
+         * 解决处于跨TAB、跨域控制时造成其它默认快捷键响应异常的问题
+         */
+        if (t.hotkeysRunner && t.hotkeysRunner.run) {
+          t.hotkeysRunner.run({
+            event,
+            stopPropagation: true,
+            preventDefault: true
+          })
+        } else {
+          t.registerHotkeysRunner()
+          event.stopPropagation()
+          event.preventDefault()
+        }
+
         // debug.log('当前页面检出了跨域受限的视频，仍需阻止默认事件和事件冒泡')
-        event.stopPropagation()
-        event.preventDefault()
-        return true
       }
 
-      // debug.log('无可用的播放，不执行相关操作')
-      return
+      // debug.log('无可用的媒体元素，不执行相关操作')
+      return false
     }
 
     /* 切换插件的可用状态 */
@@ -2032,8 +2293,32 @@ const h5Player = {
     /* 判断是否执行了自定义快捷键操作，如果是则不再响应后面默认定义操作 */
     if (t.runCustomShortcuts(player, event) === true) return
 
-    /* 响应播放器相关操作 */
-    t.palyerTrigger(player, event)
+    /* 热键运行器匹配到相关执行任务便不在执行后续的palyerTrigger */
+    if (t.hotkeysRunner && t.hotkeysRunner.run) {
+      const matchResult = t.hotkeysRunner.run({
+        event,
+        target: t,
+        stopPropagation: true,
+        preventDefault: true,
+        conditionHandler (condition) {
+          // TODO 完善条件限定回调逻辑
+          if (condition) {
+            return true
+          }
+        }
+      })
+
+      if (matchResult) {
+        debug.info('[hotkeysRunner][matchResult]', matchResult)
+        return true
+      }
+    } else {
+      /* 未用到的按键不进行任何事件监听 */
+      if (!isRegisterKey(event)) { return false }
+
+      /* 响应播放器相关操作 */
+      t.palyerTrigger(player, event)
+    }
   },
 
   /**
@@ -2288,10 +2573,10 @@ const h5Player = {
     /* 触发来自消息广播的模拟事件，实现跨域、跨Tab控制视频播放 */
     let triggerFakeEvent = function (name, oldVal, newVal, remote) {
       const player = t.player()
-      if (player) {
+      if (player && !t.__disableHotkeysTemporarily__) {
         const fakeEvent = newVal.data
-        fakeEvent.stopPropagation = () => {}
-        fakeEvent.preventDefault = () => {}
+        fakeEvent.stopPropagation = () => { }
+        fakeEvent.preventDefault = () => { }
         t.palyerTrigger(player, fakeEvent)
 
         debug.log('已响应跨Tab/跨域按键控制信息：', newVal)
@@ -2345,8 +2630,32 @@ const h5Player = {
 
     t._hasBindEvent_ = true
   },
+
+  setCustomConfiguration (config, tag = 'Default') {
+    if (!config) return false
+
+    const configuration = configManager.mergeDefConf(config.customConfiguration)
+    const taskConf = mergeTaskConf(config.customTaskControlCenter)
+    if (TCC && TCC.setTaskConf) {
+      TCC.setTaskConf(taskConf)
+    }
+
+    h5Player.hasSetCustomConfiguration = tag
+    debug.info(`[CustomConfiguration][${tag}]`, configuration, taskConf)
+  },
+
+  mergeExternalConfiguration (config, tag = 'Default') {
+    if (!config || !configManager.getGlobalStorage('enhance.allowExternalCustomConfiguration')) return false
+    h5Player.setCustomConfiguration(config, 'External')
+    h5Player.hasExternalCustomConfiguration = tag
+  },
+
   init: function (global) {
-    var t = this
+    const t = this
+
+    if (window.unsafeWindow && window.unsafeWindow.__h5PlayerCustomConfiguration__) {
+      !t.hasExternalCustomConfiguration && t.mergeExternalConfiguration(window.unsafeWindow.__h5PlayerCustomConfiguration__)
+    }
 
     if (TCC && TCC.doTask('disable') === true) {
       debug.info(`[TCC][disable][${location.host}] 已禁止在该网站运行视频检测逻辑，您可查看任务配置中心的相关配置了解详情`)
@@ -2359,14 +2668,23 @@ const h5Player = {
       return true
     }
 
+    if (configManager.get('debug') === true) {
+      window._debugMode_ = true
+      t.mountToGlobal()
+    }
+
     setFakeUA()
 
     /* 初始化任务配置中心 */
     TCC = h5PlayerTccInit(t)
 
     /* 绑定键盘事件 */
-    t.bindEvent()
-    t.bindFakeEvent()
+    if (configManager.get('enableHotkeys') !== false) {
+      t.bindEvent()
+      t.bindFakeEvent()
+    } else {
+      debug.warn('快捷键能力已被禁用')
+    }
 
     /* 响应来自跨域受限的视频检出事件 */
     monkeyMsg.on('videoDetected', async (name, oldVal, newVal, remote) => {
@@ -2382,39 +2700,55 @@ const h5Player = {
       h5Player.initAutoPlay()
     })
 
-    if (debug.isDebugMode()) {
-      t.mountToGlobal()
+    if (window.unsafeWindow && configManager.getGlobalStorage('enhance.allowExternalCustomConfiguration')) {
+      window.unsafeWindow.__setH5PlayerCustomConfiguration__ = t.mergeExternalConfiguration
     }
   }
 }
 
 async function h5PlayerInit () {
+  const isEnabled = configManager.get('enable')
+  const blackUrlList = configManager.get('blacklist.urls') || []
+  const blackDomainList = configManager.get('blacklist.domains') || []
+  const isInBlackList = blackUrlList.includes(location.href) || blackDomainList.includes(location.host)
+
+  if (isInBlackList) {
+    console.warn(`[h5player][config][blacklist][${location.href}] \n当前页面已被加入黑名单，不执行h5player增强脚本的相关逻辑，如有需要开启，请在配置里的blacklist移除对应的地址`)
+  }
+
   try {
-    mediaCore.init(function (mediaElement) {
-      // debug.log('[mediaCore][mediaChecker]', mediaElement)
-      h5Player.init()
-    })
+    if (isEnabled && !isInBlackList) {
+      mediaCore.init(function (mediaElement) {
+        h5Player.init()
+      })
 
-    if (configManager.get('enhance.allowExperimentFeatures')) {
-      mediaSource.init()
-      debug.warn(`[experimentFeatures][warning] ${i18n.t('experimentFeaturesWarning')}`)
-      debug.warn('[experimentFeatures][mediaSource][activated]')
+      if (configManager.get('enhance.allowExperimentFeatures') && configManager.get('download.enable')) {
+        mediaSource.init()
+        debug.warn(`[experimentFeatures][warning] ${i18n.t('experimentFeaturesWarning')}`)
+        debug.warn('[experimentFeatures][mediaSource][activated]')
+      }
+
+      /* 禁止对playbackRate等属性进行锁定 */
+      hackDefineProperty()
+
+      /* 禁止对shadowdom使用close模式 */
+      hackAttachShadow()
+
+      /* 对所有事件进行接管 */
+      proxyHTMLMediaElementEvent()
+      // hackEventListener()
     }
-
-    /* 禁止对playbackRate等属性进行锁定 */
-    hackDefineProperty()
-
-    /* 禁止对shadowdom使用close模式 */
-    hackAttachShadow()
-
-    /* 对所有事件进行接管 */
-    proxyHTMLMediaElementEvent()
-    // hackEventListener()
   } catch (e) {
     console.error('h5player hack error', e)
   }
 
+  /* 注意：油猴的菜单注册不能根据isEnabled禁用掉，否则没法通过油猴的菜单进行启用 */
   menuRegister()
+
+  if (!isEnabled || isInBlackList) {
+    debug.warn(`[config][disable][${location.host}] 当前网站已禁用脚本，如要启用脚本，请在菜单里开启`)
+    return false
+  }
 
   try {
     /* 初始化全局所需的相关方法 */
@@ -2441,17 +2775,50 @@ async function h5PlayerInit () {
     crossTabCtl.init()
 
     if (isInIframe()) {
-      debug.log('h5Player init suc, in iframe:', window, window.location.href)
+      debug.log('h5Player init suc, in iframe:')
     } else {
-      debug.log('h5Player init suc', window, h5Player)
+      debug.log('h5Player init suc')
     }
 
     if (isInCrossOriginFrame()) {
       debug.log('当前处于跨域受限的iframe中，h5Player部分功能可能无法正常开启', window.location.href)
     }
+
+    /* 注册鼠标控制事件 */
+    if (configManager.get('mouse.enable')) {
+      registerMouseEvent(h5Player)
+    }
   } catch (e) {
     debug.error('h5Player init fail', e)
   }
+
+  /* 注意：只有明确为fasle才隐藏GUI */
+  if (configManager.get('ui.enable') !== false) {
+    if (window.customElements && document.adoptedStyleSheets) {
+      h5Player.UI = h5playerUiWraper(windowSandbox)
+      setTimeout(async () => {
+        h5Player.UI.init()
+      }, 400)
+    } else {
+      /* webkit内核建议73以上的浏览器才允许使用UI组件，否则兼容或性能都是很大的问题 */
+      debug.warn('当前浏览器不支持customElements或adoptedStyleSheets，无法使用UI组件，建议使用Chrome 83+，Edge 83+')
+    }
+  } else {
+    debug.warn('UI组件已被禁用', configManager.get('ui.enable'))
+  }
+
+  /**
+   * 跟官网远程助手进行互动，有严重安全或信息洁癖的人手动注释下面代码即可
+   * 下面代码不会影响主要功能的正常使用
+   * 不注释代码，禁用UI界面也有同等效果
+   */
+  try {
+    configManager.get('ui.enable') !== false && remoteHelper.init()
+  } catch (e) {
+    debug.error('[remoteHelper.init]', e)
+  }
+
+  // console.clear = () => {}
 }
 
 export default h5PlayerInit
